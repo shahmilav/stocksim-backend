@@ -21,4 +21,6 @@ url = "2.5.4"
 dotenv = "0.15"
 time = "0.3.36"
 tower-sessions-rusqlite-store = "0.13.0"
-
+mongodb = {version="3.1.0", features = []}
+bson = "2.13.0"
+futures-util = "0.3.31"
