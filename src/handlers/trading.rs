@@ -1,6 +1,6 @@
-use crate::auth::GoogleUserInfo;
+use crate::auth::validate_session;
 use crate::db::DatabasePool;
-use crate::finnhub::{fetch_stock_name, fetch_stock_price};
+use crate::finnhub::{fetch_stock_price, fetch_stock_profile};
 use crate::models::{TradeRequest, Transaction};
 use axum::{extract::State, http::StatusCode, Json};
 use tower_sessions::Session;
@@ -12,144 +12,160 @@ pub async fn buy_stock(
     session: Session,
     Json(trade): Json<TradeRequest>,
 ) -> Result<(StatusCode, Json<Transaction>), (StatusCode, Json<String>)> {
-    let sess: GoogleUserInfo = session.get("SESSION").await.unwrap().unwrap_or_default();
-    let s = sess.email;
+    let info = match validate_session(session).await {
+        Ok(info) => info,
+        Err(status) => return Err((status, Json("Unauthorized access".to_string()))),
+    };
+    let s = info.email;
 
-    // validate that this session exists!
-    if s.is_empty() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json("Unauthorized access".to_string()),
-        ));
-    }
-
-    let mut conn = pool.0.lock().await;
-
-    // Fetch stock price from Finnhub API
-    let stock_price = (fetch_stock_price(&trade.stock_symbol)
-        .await
-        .map_err(|e| {
-            (
+    let stock_price = match fetch_stock_price(&trade.stock_symbol).await {
+        Ok(price) => (price.c * 100.0) as i32,
+        Err(_) => {
+            return Err((
                 StatusCode::BAD_REQUEST,
-                Json(format!("Error fetching stock price: {}", e)),
-            )
-        })?
-        .c
-        * 100.0) as i32;
+                Json(String::from("Error completing trade")),
+            ))
+        }
+    };
 
-    let stock_name = fetch_stock_name(&trade.stock_symbol).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(format!("Error fetching stock name: {}", e)),
-        )
-    })?;
+    let stock_name = match fetch_stock_profile(&trade.stock_symbol).await {
+        Ok(stock) => stock.name,
+        Err(e) => {
+            tracing::error!("Error fetching stock profile: {}", e);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(String::from("Error completing trade")),
+            ));
+        }
+    };
 
     let total_cost = stock_price * trade.quantity;
 
-    // Start transaction
-    let tx = conn.transaction().map_err(|e| {
+    let mut session = pool.client.start_session().await.unwrap();
+
+    session.start_transaction().await.map_err(|e| {
+        tracing::error!("Error starting transaction: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(format!("Database error: {}", e)),
+            Json(String::from("Error completing trade")),
         )
     })?;
 
-    // Check if account has enough cash
-    let mut account_cash: i32 = tx
-        .query_row("SELECT cash FROM accounts WHERE id = ?", [&s], |row| {
-            row.get(0)
-        })
-        .map_err(|_| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(format!("Account {} not found", s)),
+    let result = async {
+        // Check if account has enough cash
+        // Update account cash
+        // Update or insert holding
+        // Record transaction
+        // Commit transaction
+        // Return transaction
+
+        let mut account = pool
+            .get_account(&s)
+            .await
+            .map_err(|e| {
+                tracing::error!("Error fetching account: {}", e);
+                return Err::<Transaction, (StatusCode, Json<String>)>((
+                    StatusCode::NOT_FOUND,
+                    Json(String::from("Error completing trade")),
+                ));
+            })
+            .unwrap()
+            .unwrap();
+
+        if account.cash < total_cost {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(String::from(
+                    "You don't have enough cash to complete this trade.",
+                )),
+            ));
+        }
+
+        account.cash -= total_cost;
+
+        pool.update_account(&s, account.value as i64, account.cash as i64)
+            .await
+            .map_err(|e| {
+                tracing::error!("Error updating account cash: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(String::from("Error completing trade")),
+                )
+            })?;
+        // update holdings
+        let holding = pool.get_holding(&s, &trade.stock_symbol).await.unwrap();
+        let holding = holding.unwrap_or_default();
+        if holding.quantity > 0 {
+            let new_quantity = holding.quantity + trade.quantity;
+            let new_price = ((holding.purchase_price * holding.quantity)
+                + (stock_price * trade.quantity))
+                / (holding.quantity + trade.quantity);
+
+            pool.update_holding(
+                &s,
+                &trade.stock_symbol,
+                new_quantity as i64,
+                new_price as i64,
             )
-        })?;
+            .await
+            .map_err(|e| {
+                tracing::error!("Error updating holding: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(String::from("Error completing trade")),
+                )
+            })?;
+        } else {
+            // insert holding
+            pool.add_holding(crate::models::Holding {
+                account_id: s.clone(),
+                stock_symbol: trade.stock_symbol.clone(),
+                stock_name: stock_name.clone(),
+                quantity: trade.quantity,
+                purchase_price: stock_price,
+                total_value: stock_price * trade.quantity,
+                current_price: stock_price,
+            })
+            .await
+            .unwrap();
+        }
 
-    if account_cash < total_cost {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(String::from("Insufficient funds")),
-        ));
+        // Record transaction
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        pool.add_transaction(crate::models::Transaction {
+            id: transaction_id.clone(),
+            account_id: s.clone(),
+            stock_symbol: trade.stock_symbol.clone(),
+            transaction_type: String::from("BUY"),
+            quantity: trade.quantity,
+            price: stock_price,
+            timestamp: chrono::Local::now().to_rfc3339(),
+        })
+        .await
+        .unwrap();
+
+        Ok(Transaction {
+            id: transaction_id,
+            account_id: s,
+            stock_symbol: trade.stock_symbol,
+            transaction_type: String::from("BUY"),
+            quantity: trade.quantity,
+            price: stock_price,
+            timestamp: chrono::Local::now().to_rfc3339(),
+        })
     }
+    .await;
 
-    // Update account cash
-    account_cash -= total_cost;
-    tx.execute(
-        "UPDATE accounts SET cash = ? WHERE id = ?",
-        rusqlite::params![account_cash, &s],
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(format!("Database error: {}", e)),
-        )
-    })?;
-
-    // Update or insert holding
-    tx.execute(
-    "INSERT INTO holdings (account_id, stock_symbol, stock_name, quantity, purchase_price)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(account_id, stock_symbol)
-     DO UPDATE SET 
-         quantity = holdings.quantity + excluded.quantity,
-         purchase_price = ((holdings.purchase_price * holdings.quantity) + (excluded.purchase_price * excluded.quantity)) 
-                          / (holdings.quantity + excluded.quantity)",
-    rusqlite::params![
-        &s,
-        &trade.stock_symbol,
-        stock_name,
-        trade.quantity,
-        stock_price,
-    ],
-)
-.map_err(|e| {
-    tracing::error!("Error inserting holding: {}", e);
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(format!("Database error: {}", e)),
-    )
-})?;
-
-    // Record transaction
-    let transaction_id = uuid::Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO transactions (id, account_id, stock_symbol, transaction_type, quantity, price)
-         VALUES (?, ?, ?, ?, ?, ?)",
-        rusqlite::params![
-            &transaction_id,
-            &s,
-            &trade.stock_symbol,
-            "BUY",
-            trade.quantity,
-            stock_price
-        ],
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(format!("Database error: {}", e)),
-        )
-    })?;
-
-    tx.commit().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(format!("Database error: {}", e)),
-        )
-    })?;
-
-    let transaction = Transaction {
-        id: transaction_id,
-        account_id: s,
-        stock_symbol: trade.stock_symbol,
-        transaction_type: String::from("BUY"),
-        quantity: trade.quantity,
-        price: stock_price,
-        timestamp: chrono::Local::now().to_rfc3339(),
-    };
-
-    Ok((StatusCode::CREATED, Json(transaction)))
+    match result {
+        Ok(transaction) => {
+            session.commit_transaction().await.unwrap();
+            Ok((StatusCode::CREATED, Json(transaction)))
+        }
+        Err(e) => {
+            session.abort_transaction().await.unwrap();
+            Err(e)
+        }
+    }
 }
 
 /// Sell a stock with a given account ID. The request body should contain the stock symbol and the quantity to sell.
@@ -158,26 +174,20 @@ pub async fn sell_stock(
     session: Session,
     Json(trade): Json<TradeRequest>,
 ) -> Result<(StatusCode, Json<Transaction>), (StatusCode, Json<String>)> {
-    let sess: GoogleUserInfo = session.get("SESSION").await.unwrap().unwrap_or_default();
-    let s = sess.email;
-
-    // validate that this session exists!
-    if s.is_empty() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json("Unauthorized access".to_string()),
-        ));
-    }
-
-    let mut conn = pool.0.lock().await;
+    let info = match validate_session(session).await {
+        Ok(info) => info,
+        Err(status) => return Err((status, Json("Unauthorized access".to_string()))),
+    };
+    let s = info.email;
 
     // Fetch stock price from Finnhub API
     let stock_price = (fetch_stock_price(&trade.stock_symbol)
         .await
         .map_err(|e| {
+            tracing::error!("Error fetching stock price: {}", e);
             (
                 StatusCode::BAD_REQUEST,
-                Json(format!("Error fetching stock price: {}", e)),
+                Json(String::from("Error completing trade")),
             )
         })?
         .c
@@ -185,109 +195,115 @@ pub async fn sell_stock(
 
     let total_value = stock_price * trade.quantity;
 
-    let tx = conn.transaction().map_err(|e| {
+    let mut session = pool.client.start_session().await.unwrap();
+
+    session.start_transaction().await.map_err(|e| {
+        tracing::error!("Error starting transaction: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(format!("Database error: {}", e)),
+            Json(String::from("Error completing trade")),
         )
     })?;
 
-    // Check if account has enough shares
-    let current_quantity: i32 = tx
-        .query_row(
-            "SELECT quantity FROM holdings WHERE account_id = ? AND stock_symbol = ?",
-            [&s, &trade.stock_symbol],
-            |row| row.get(0),
-        )
-        .map_err(|_| {
-            (
+    let result = async {
+        // Check if account has enough shares
+        // Update account cash
+        // Update holdings
+        // Record transaction
+        // Commit transaction
+        // Return transaction
+
+        let mut account = pool
+            .get_account(&s)
+            .await
+            .map_err(|e| {
+                tracing::error!("Error fetching account: {}", e);
+                return Err::<Transaction, (StatusCode, Json<String>)>((
+                    StatusCode::NOT_FOUND,
+                    Json(String::from("Error completing trade")),
+                ));
+            })
+            .unwrap()
+            .unwrap();
+
+        let current_quantity = pool
+            .get_holding(&s, &trade.stock_symbol)
+            .await
+            .map_err(|e| {
+                tracing::error!("Error fetching holding: {}", e);
+                return Err::<Transaction, (StatusCode, Json<String>)>((
+                    StatusCode::NOT_FOUND,
+                    Json(String::from("You cannot sell a stock you do not own.")),
+                ));
+            })
+            .unwrap()
+            .unwrap()
+            .quantity;
+
+        if current_quantity < trade.quantity {
+            return Err((
                 StatusCode::BAD_REQUEST,
-                Json(String::from("No shares owned of this stock")),
-            )
-        })?;
+                Json(String::from("You cannot sell more shares than you own.")),
+            ));
+        }
 
-    if current_quantity < trade.quantity {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(String::from("Insufficient shares")),
-        ));
+        account.cash += total_value;
+        pool.update_account(&s, account.value as i64, account.cash as i64)
+            .await
+            .unwrap();
+
+        let new_quantity = current_quantity - trade.quantity;
+        if new_quantity == 0 {
+            pool.delete_holding(&s, &trade.stock_symbol).await.unwrap();
+        } else {
+            let holding = pool
+                .get_holding(&s, &trade.stock_symbol)
+                .await
+                .unwrap()
+                .unwrap();
+            pool.update_holding(
+                &s,
+                &trade.stock_symbol,
+                new_quantity as i64,
+                holding.purchase_price as i64,
+            )
+            .await
+            .unwrap();
+        }
+
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        pool.add_transaction(crate::models::Transaction {
+            id: transaction_id.clone(),
+            account_id: s.clone(),
+            stock_symbol: trade.stock_symbol.clone(),
+            transaction_type: String::from("SELL"),
+            quantity: trade.quantity,
+            price: stock_price,
+            timestamp: chrono::Local::now().to_rfc3339(),
+        })
+        .await
+        .unwrap();
+
+        Ok(Transaction {
+            id: transaction_id,
+            account_id: s,
+            stock_symbol: trade.stock_symbol,
+            transaction_type: String::from("SELL"),
+            quantity: trade.quantity,
+            price: stock_price,
+            timestamp: chrono::Local::now().to_rfc3339(),
+        })
     }
+    .await;
 
-    // Update account cash
-    tx.execute(
-        "UPDATE accounts SET cash = cash + ? WHERE id = ?",
-        rusqlite::params![total_value, &s],
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(format!("Database error: {}", e)),
-        )
-    })?;
-
-    // Update holdings
-    let new_quantity = current_quantity - trade.quantity;
-    if new_quantity == 0 {
-        tx.execute(
-            "DELETE FROM holdings WHERE account_id = ? AND stock_symbol = ?",
-            [&s, &trade.stock_symbol],
-        )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(format!("Database error: {}", e)),
-            )
-        })?;
-    } else {
-        tx.execute(
-            "UPDATE holdings SET quantity = ? WHERE account_id = ? AND stock_symbol = ?",
-            rusqlite::params![new_quantity, &s, &trade.stock_symbol],
-        )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(format!("Database error: {}", e)),
-            )
-        })?;
+    match result {
+        Ok(transaction) => {
+            session.commit_transaction().await.unwrap();
+            Ok((StatusCode::CREATED, Json(transaction)))
+        }
+        Err(e) => {
+            session.abort_transaction().await.unwrap();
+            Err(e)
+        }
     }
-
-    // Record transaction
-    let transaction_id = uuid::Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO transactions (id, account_id, stock_symbol, transaction_type, quantity, price)
-         VALUES (?, ?, ?, ?, ?, ?)",
-        rusqlite::params![
-            &transaction_id,
-            &s,
-            &trade.stock_symbol,
-            "SELL",
-            trade.quantity,
-            stock_price
-        ],
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(format!("Database error: {}", e)),
-        )
-    })?;
-
-    tx.commit().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(format!("Database error: {}", e)),
-        )
-    })?;
-
-    let transaction = Transaction {
-        id: transaction_id,
-        account_id: s,
-        stock_symbol: trade.stock_symbol,
-        transaction_type: String::from("SELL"),
-        quantity: trade.quantity,
-        price: stock_price,
-        timestamp: chrono::Local::now().to_rfc3339(),
-    };
-
-    Ok((StatusCode::CREATED, Json(transaction)))
 }

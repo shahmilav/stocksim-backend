@@ -1,6 +1,6 @@
-use crate::auth::GoogleUserInfo;
+use crate::auth::validate_session;
 use crate::db::DatabasePool;
-use crate::finnhub::fetch_stock_price;
+use crate::finnhub::{fetch_stock_price, fetch_stock_profile};
 use crate::models::{HoldingResponse, Portfolio, Transaction};
 use axum::{extract::State, http::StatusCode, Json};
 use tower_sessions::Session;
@@ -9,81 +9,57 @@ pub async fn get_portfolio(
     session: Session,
     State(pool): State<DatabasePool>,
 ) -> Result<(StatusCode, Json<Portfolio>), (StatusCode, Json<String>)> {
-    let sess: GoogleUserInfo = session.get("SESSION").await.unwrap().unwrap_or_default();
-    let s = sess.email;
+    // Validate the session
+    let info = match validate_session(session).await {
+        Ok(info) => info,
+        Err(status) => return Err((status, Json("Unauthorized access".to_string()))),
+    };
+    let account_id = info.email;
 
-    // validate that this session exists!
-    if s.is_empty() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json("Unauthorized access".to_string()),
-        ));
-    }
-
-    // Get a database connection
-    let conn = pool.0.lock().await;
-
-    // Fetch holdings in a blocking manner
-    let holdings: Vec<HoldingResponse> = {
-        let mut stmt = match conn
-            .prepare("SELECT stock_symbol, stock_name, quantity, purchase_price FROM holdings WHERE account_id = ?")
-        {
-            Ok(stmt) => stmt,
-            Err(_) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json("Failed to prepare SQL statement".to_string()),
-                ));
-            }
-        };
-
-        match stmt
-            .query_map([&s], |row| {
-                Ok(HoldingResponse {
-                    stock_symbol: row.get(0)?,
-                    stock_name: row.get(1)?,
-                    quantity: row.get(2)?,
-                    purchase_price: row.get(3)?,
-                    current_price: 0,
-                    total_value: 0,
-                    day_change: 0,
-                    day_change_percent: 0,
-                })
-            })
-            .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
-        {
-            Ok(holdings) => holdings,
-            Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(format!("Failed to fetch holdings: {}", e)),
-                ));
-            }
+    // Use the `get_holdings` method
+    let holdings = match pool.get_holdings(&account_id).await {
+        Ok(holdings) => holdings,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(format!("Failed to fetch holdings: {}", e)),
+            ));
         }
     };
 
-    // Asynchronously fetch stock prices
-    let mut updated_holdings = Vec::new();
-
-    let mut sum_of_total_values = 0;
-
+    let mut h: Vec<HoldingResponse> = Vec::new();
     for holding in holdings {
+        h.push(HoldingResponse {
+            stock_symbol: holding.stock_symbol,
+            stock_name: holding.stock_name,
+            quantity: holding.quantity,
+            current_price: holding.current_price,
+            total_value: holding.total_value,
+            day_change: 0,
+            day_change_percent: 0,
+            purchase_price: holding.purchase_price,
+            stock_logo_url: String::from(""),
+            overall_change: 0,
+            category: String::from(""),
+        });
+    }
+
+    let mut updated_holdings = Vec::new();
+    let mut total_portfolio_value = 0;
+
+    for mut holding in h {
+        // Fetch stock price and update holding
         match fetch_stock_price(&holding.stock_symbol).await {
             Ok(quote) => {
-                let price = (quote.c * 100.0) as i32; // Convert to cents
-                let day_change = (quote.d * 100.0) as i32;
-                let day_change_percent = (quote.dp * 100.0) as i32;
+                let current_price = (quote.c * 100.0) as i32;
+                let total_value = current_price * holding.quantity;
+                holding.current_price = current_price;
+                holding.total_value = total_value;
+                holding.overall_change = total_value - (holding.purchase_price * holding.quantity);
+                holding.day_change = (quote.d * 100.0) as i32;
+                holding.day_change_percent = (quote.dp * 100.0) as i32;
 
-                let total_value = price * holding.quantity;
-                sum_of_total_values += total_value;
-                updated_holdings.push(HoldingResponse {
-                    current_price: price,
-                    day_change,
-                    day_change_percent,
-
-                    total_value,
-                    ..holding
-                });
+                total_portfolio_value += total_value;
             }
             Err(e) => {
                 return Err((
@@ -92,17 +68,38 @@ pub async fn get_portfolio(
                 ));
             }
         }
+
+        // Fetch stock profile for logo and category
+        if let Ok(profile) = fetch_stock_profile(&holding.stock_symbol).await {
+            holding.stock_logo_url = profile.logo;
+            holding.category = profile.finnhub_industry;
+        }
+
+        updated_holdings.push(holding);
     }
 
-    // Update account value = cash + sum of total values of holdings
-    conn.execute(
-        "UPDATE accounts SET value = cash + ? WHERE id = ?",
-        rusqlite::params![sum_of_total_values, &s],
+    let account = match pool.get_account(&account_id).await {
+        Ok(account) => account,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(format!("Failed to fetch account details: {}", e)),
+            ));
+        }
+    }
+    .unwrap();
+    // todo: Update the account value in the database
+
+    pool.update_account(
+        &account_id,
+        (account.cash + total_portfolio_value) as i64,
+        account.cash as i64,
     )
+    .await
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(format!("Failed to update account value: {}", e)),
+            Json(format!("Failed to update account: {}", e)),
         )
     })?;
 
@@ -116,61 +113,26 @@ pub async fn get_portfolio(
 }
 
 pub async fn get_transaction_history(
-    State(pool): State<DatabasePool>,
     session: Session,
+    State(pool): State<DatabasePool>,
 ) -> Result<(StatusCode, Json<Vec<Transaction>>), (StatusCode, Json<String>)> {
-    let sess: GoogleUserInfo = session.get("SESSION").await.unwrap().unwrap_or_default();
-    let s = sess.email;
+    // Validate the session
+    let info = match validate_session(session).await {
+        Ok(info) => info,
+        Err(status) => return Err((status, Json("Unauthorized access".to_string()))),
+    };
+    let account_id = info.email;
 
-    // validate that this session exists!
-    if s.is_empty() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json("Unauthorized access".to_string()),
-        ));
-    }
-
-    let conn = pool.0.lock().await;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, stock_symbol, transaction_type, quantity, price, timestamp
-             FROM transactions
-             WHERE account_id = ?
-             ORDER BY timestamp DESC",
-        )
-        .map_err(|e| {
-            (
+    // Use the `get_transactions` method
+    let transactions = match pool.get_transactions(&account_id).await {
+        Ok(transactions) => transactions,
+        Err(e) => {
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(format!("Database error: {}", e)),
-            )
-        })?;
-
-    let transactions: Vec<Transaction> = stmt
-        .query_map([&s], |row| {
-            Ok(Transaction {
-                id: row.get(0)?,
-                account_id: s.clone(),
-                stock_symbol: row.get(1)?,
-                transaction_type: row.get(2)?,
-                quantity: row.get(3)?,
-                price: row.get(4)?,
-                timestamp: row.get(5)?,
-            })
-        })
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(format!("Database error: {}", e)),
-            )
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(format!("Database error: {}", e)),
-            )
-        })?;
+                Json(format!("Failed to fetch transactions: {}", e)),
+            ));
+        }
+    };
 
     Ok((StatusCode::OK, Json(transactions)))
 }

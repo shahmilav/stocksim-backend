@@ -1,4 +1,4 @@
-use crate::auth::GoogleUserInfo;
+use crate::auth::validate_session;
 use crate::db::DatabasePool;
 use crate::finnhub::fetch_stock_price;
 use crate::models::Account;
@@ -11,83 +11,58 @@ pub async fn get_account(
     State(pool): State<DatabasePool>,
     session: Session,
 ) -> Result<(StatusCode, Json<Account>), (StatusCode, Json<String>)> {
-    let sess: GoogleUserInfo = session.get("SESSION").await.unwrap().unwrap_or_default();
-    let s = sess.email;
+    // Validate the session
+    let info = match validate_session(session).await {
+        Ok(info) => info,
+        Err(status) => return Err((status, Json("Unauthorized access".to_string()))),
+    };
+    let account_id = info.email;
 
-    // Validate that this session exists!
-    if s.is_empty() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json("Unauthorized access".to_string()),
-        ));
-    }
-
-    // Lock the connection
-    let conn = pool.0.lock().await;
-
-    // Fetch account details
-    let mut account = {
-        let mut stmt = conn
-            .prepare("SELECT id, value, cash FROM accounts WHERE id = ?")
-            .unwrap();
-
-        stmt.query_row([&s], |row| {
-            Ok(Account {
-                id: row.get(0)?,
-                value: row.get(1)?,
-                cash: row.get(2)?,
-                change: 0,
-            })
-        })
-        .unwrap()
+    // Fetch the account details using `get_account` method
+    let account = match pool.get_account(&account_id).await {
+        Ok(account) => account,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(format!("Failed to fetch account details: {}", e)),
+            ));
+        }
     };
 
-    // Fetch holdings
-    #[derive(Debug, Clone)]
-    struct T {
-        stock_symbol: String,
-        quantity: i32,
-    }
-    let holdings: Vec<T> = {
-        let mut stmt = conn
-            .prepare("SELECT stock_symbol, quantity FROM holdings WHERE account_id = ?")
-            .unwrap();
-
-        stmt.query_map([&s], |row| {
-            Ok(T {
-                stock_symbol: row.get(0)?,
-                quantity: row.get(1)?,
-            })
-        })
-        .unwrap()
-        .collect::<Result<Vec<T>, _>>()
-        .unwrap()
+    // Fetch holdings using `get_holdings` method
+    let holdings = match pool.get_holdings(&account_id).await {
+        Ok(holdings) => holdings,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(format!("Failed to fetch holdings: {}", e)),
+            ));
+        }
     };
 
-    // Process stock price changes
-    let mut sumchanges = 0;
-    for h in holdings.iter() {
-        match fetch_stock_price(&h.stock_symbol).await {
+    // Calculate changes based on stock prices
+    let mut sum_changes = 0;
+    for holding in holdings {
+        match fetch_stock_price(&holding.stock_symbol).await {
             Ok(quote) => {
-                let current_value = (quote.c * 100.0) as i32 * h.quantity;
-                let yesterday = (quote.pc * 100.0) as i32 * h.quantity;
-                let change = current_value - yesterday;
-                sumchanges += change;
+                let current_value = (quote.c * 100.0) as i32 * holding.quantity;
+                let yesterday_value = (quote.pc * 100.0) as i32 * holding.quantity;
+                sum_changes += current_value - yesterday_value;
             }
-            Err(_) => {
+            Err(e) => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json("Failed to fetch stock price".to_string()),
+                    Json(format!("Failed to fetch stock price: {}", e)),
                 ));
             }
         }
     }
 
-    // Update account change
-    account.change = sumchanges;
+    let mut a = account.unwrap();
 
-    // Return account if found
-    Ok((StatusCode::OK, Json(account)))
+    // Update the `change` field of the account
+    a.change = sum_changes;
+
+    // Return the updated account
+    Ok((StatusCode::OK, Json(a)))
 }
-
-

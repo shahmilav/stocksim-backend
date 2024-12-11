@@ -17,11 +17,13 @@ pub struct CreateAccount {
 }
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Holding {
+    pub account_id: String,
     pub stock_symbol: String,
     pub stock_name: String,
     pub quantity: i32,
     pub current_price: i32,
     pub total_value: i32,
+    pub purchase_price: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -34,6 +36,9 @@ pub struct HoldingResponse {
     pub day_change: i32,
     pub day_change_percent: i32,
     pub purchase_price: i32,
+    pub stock_logo_url: String,
+    pub overall_change: i32,
+    pub category: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

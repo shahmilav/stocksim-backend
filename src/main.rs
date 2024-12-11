@@ -1,22 +1,21 @@
+mod auth;
 mod db;
+mod finnhub;
 mod handlers;
 mod models;
 
-mod auth;
-mod finnhub;
-
 use crate::auth::{get_user_data, handle_google_callback, logout, start_google_login};
+use crate::db::DatabasePool;
+use crate::handlers::{
+    accounts::get_account,
+    portfolio::{get_portfolio, get_transaction_history},
+    trading::{buy_stock, sell_stock},
+};
 use axum::http::header::{ACCESS_CONTROL_ALLOW_CREDENTIALS, CONTENT_TYPE, COOKIE};
 use axum::http::HeaderValue;
 use axum::{
     routing::{get, post},
     Router,
-};
-use db::DatabasePool;
-use handlers::{
-    accounts::get_account,
-    portfolio::{get_portfolio, get_transaction_history},
-    trading::{buy_stock, sell_stock},
 };
 use reqwest::Method;
 use rusqlite::Connection;
@@ -29,15 +28,33 @@ use tracing::Level;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let conn = Connection::open(&"sessions.db").unwrap();
+    // Set the log level based on the first argument
+    let args: Vec<String> = std::env::args().collect();
+    let mut log_level = Level::INFO;
+    if args.len() >= 2 {
+        log_level = match args[1].as_str() {
+            "debug" => Level::DEBUG,
+            "warn" => Level::WARN,
+            "error" => Level::ERROR,
+            _ => Level::INFO,
+        };
+    }
+
+    let db_path = ".";
+
+    // Initialize our session store as a SQLite database
+    let conn = Connection::open(format!("{}{}", db_path, "/sessions.db")).unwrap();
     let session_store = RusqliteStore::new(conn.into());
     session_store.migrate().await?;
+
+    // Start a task to delete expired sessions every 5 seconds
     let deletion_task = tokio::task::spawn(
         session_store
             .clone()
             .continuously_delete_expired(tokio::time::Duration::from_secs(5)),
     );
 
+    // Create session layer with some configuration
     let session_layer = SessionManagerLayer::new(session_store)
         .with_secure(false)
         .with_expiry(Expiry::OnInactivity(Duration::days(7)))
@@ -48,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initalize dotenv so we can read .env file
     dotenv::dotenv().ok();
 
+    // Initialize CORS layer
     let cors = CorsLayer::new()
         .allow_credentials(true)
         .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap())
@@ -58,15 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_target(false)
         .compact()
+        .with_max_level(log_level)
         .init();
 
+    tracing::info!("Log level set to: {}", log_level);
+
+    let uri = dotenv::var("MONGO_URI").expect("MONGO_URI must be set");
     // Initialize database pool
-    let pool = DatabasePool::new().unwrap();
+    let pool = DatabasePool::new(&uri.to_string()).await.unwrap();
 
     // Build application with routes
     let app = Router::new()
-        .route("/user", get(get_user_data))
-        .route("/logout", get(logout))
         // Account routes
         .route("/account", get(get_account))
         // Trading routes
@@ -77,8 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/transactions", get(get_transaction_history))
         // Auth routes
         .route("/login", get(start_google_login))
+        .route("/logout", get(logout))
         .route("/callback", get(handle_google_callback))
+        .route("/user", get(get_user_data))
+        // Database app state
         .with_state(pool)
+        // Session, CORS, and tracing layers
         .layer(session_layer)
         .layer(cors)
         .layer(
@@ -89,8 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run server
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    tracing::info!("Listening on: {}", listener.local_addr().unwrap());
 
+    tracing::info!("Listening on: {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 
     deletion_task.await??;
