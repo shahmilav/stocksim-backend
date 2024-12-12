@@ -65,8 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initalize dotenv so we can read .env file
     dotenv::dotenv().ok();
 
-    let frontend_port = dotenv::var("FRONTEND_PORT").unwrap_or_else(|_| "5173".to_string());
-    let origin = format!("http://localhost:{}", frontend_port);
+    let frontend_port =
+        dotenv::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:5173".to_string());
+    let origin = format!("{}", frontend_port);
 
     // Initialize CORS layer
     let cors = CorsLayer::new()
@@ -95,7 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Trading routes
         .route("/buy", post(buy_stock))
         .route("/sell", post(sell_stock))
-        // Portfolio and transaction routes
         .route("/portfolio", get(get_portfolio))
         .route("/transactions", get(get_transaction_history))
         // Auth routes
@@ -124,3 +124,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+

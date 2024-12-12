@@ -89,8 +89,9 @@ pub async fn handle_google_callback(
             tracing::error!("Error inserting session: {:?}", e);
         }
     };
-    let frontend_port = env::var("FRONTEND_PORT").unwrap_or_else(|_| "5173".to_string());
-    let redirect_url = format!("http://localhost:{}/home", frontend_port);
+    let frontend_port =
+        env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:5173".to_string());
+    let redirect_url = format!("{}/home", frontend_port);
     Redirect::to(&redirect_url)
 }
 
@@ -98,8 +99,9 @@ pub async fn handle_google_callback(
 pub async fn logout(session: Session) -> Redirect {
     session.remove::<GoogleUserInfo>("SESSION").await.unwrap();
     session.flush().await.unwrap();
-    let frontend_port = env::var("FRONTEND_PORT").unwrap_or_else(|_| "5173".to_string());
-    let redirect_url = format!("http://localhost:{}", frontend_port);
+    let frontend_port =
+        env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:5173".to_string());
+    let redirect_url = format!("{}", frontend_port);
     Redirect::to(&redirect_url)
 }
 
@@ -152,3 +154,4 @@ impl Default for GoogleUserInfo {
         }
     }
 }
+
