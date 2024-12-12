@@ -65,10 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initalize dotenv so we can read .env file
     dotenv::dotenv().ok();
 
+    let frontend_port = dotenv::var("FRONTEND_PORT").unwrap_or_else(|_| "5173".to_string());
+    let origin = format!("http://localhost:{}", frontend_port);
+
     // Initialize CORS layer
     let cors = CorsLayer::new()
         .allow_credentials(true)
-        .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap())
+        .allow_origin(origin.parse::<HeaderValue>().unwrap())
         .allow_methods(vec![Method::GET, Method::POST])
         .allow_headers(vec![ACCESS_CONTROL_ALLOW_CREDENTIALS, CONTENT_TYPE, COOKIE]);
 

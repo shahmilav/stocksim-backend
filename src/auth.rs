@@ -74,7 +74,7 @@ pub async fn handle_google_callback(
         pool.add_account(crate::models::Account {
             id: user_info_resp.email.to_string(),
             cash: 100000_00,
-            value: 100000_00,
+            value: 100000,
             change: 0,
         })
         .await
@@ -88,16 +88,19 @@ pub async fn handle_google_callback(
         Err(e) => {
             tracing::error!("Error inserting session: {:?}", e);
         }
-    }
-    Redirect::temporary("http://localhost:5173/home")
+    };
+    let frontend_port = env::var("FRONTEND_PORT").unwrap_or_else(|_| "5173".to_string());
+    let redirect_url = format!("http://localhost:{}/home", frontend_port);
+    Redirect::to(&redirect_url)
 }
 
 /// Logout the user by removing the session.
 pub async fn logout(session: Session) -> Redirect {
     session.remove::<GoogleUserInfo>("SESSION").await.unwrap();
     session.flush().await.unwrap();
-
-    Redirect::to("http://localhost:5173")
+    let frontend_port = env::var("FRONTEND_PORT").unwrap_or_else(|_| "5173".to_string());
+    let redirect_url = format!("http://localhost:{}", frontend_port);
+    Redirect::to(&redirect_url)
 }
 
 /// Get user data from the session.
